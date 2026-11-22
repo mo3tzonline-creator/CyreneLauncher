@@ -1,7 +1,6 @@
 package orbis.launcher;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -44,13 +43,8 @@ class LauncherScreen {
 
     private final LauncherConfig config;
     private CrashAnalyzer.Report crash;
-    private String sharePreview, shareUrl;
-    private List<String> shareLines = List.of();
-    private int shareScroll;
-    private boolean[][] shareQr;
     private final Renderer r;
     private final Input input = new Input();
-    private final ThreadLocal<InstallContinuation.Request> installationRequest = new ThreadLocal<>();
     private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> {
         Thread t = new Thread(task, "launcher worker");
         t.setDaemon(true);
@@ -173,7 +167,8 @@ class LauncherScreen {
 
     /** A Modrinth client for the selected instance: its game version, and Quilt instances also take Fabric mods. */
     private ModrinthClient newModrinth() {
-        return new ModrinthClient(config.gameVersion(), LoaderLaunch.modrinthLoaders(config.loader()));
+        return new ModrinthClient(config.gameVersion(), config.loader() == VersionStore.Loader.QUILT
+                ? List.of("quilt", "fabric") : List.of("fabric"));
     }
 
     void run() throws IOException {
@@ -338,10 +333,6 @@ class LauncherScreen {
                 if (accountRemovePending == null) break;
                 continue;
             }
-            if (sharePreview != null) {
-                shareLogAction(action);
-                break;
-            }
             if (login != null) {
                 if (action == Input.Action.BACK) { cancelMicrosoftLogin(); break; }
                 continue;
@@ -381,7 +372,7 @@ class LauncherScreen {
                 act(event);
                 if (editor.active() || systemKeyboardOpen || removePending != null
                         || instanceRemovePending != null || accountRemovePending != null || cloneOptions
-                        || login != null || plan != null || pack != null || sharePreview != null) break;
+                        || login != null || plan != null || pack != null) break;
             }
         }
     }
@@ -389,9 +380,10 @@ class LauncherScreen {
     private void beginEdit(Field field, Input.Source source) {
         editingField = field;
         InstanceStore.Instance current = config.selectedInstance();
-        String initial = field == Field.OFFLINE_NAME ? "" : field == Field.SEARCH ? query.toString()
+        String initial = field == Field.SEARCH ? query.toString()
                 : field == Field.JVM_ARGS ? current.jvmArgs()
                 : field == Field.GAME_ARGS ? current.gameArgs()
+                : field == Field.OFFLINE_NAME ? ""
                 : nameMode == NameMode.RENAME ? config.instances.get(nameTargetId).name()
                 : nameMode == NameMode.CLONE ? config.instances.get(nameTargetId).name() + " Copy"
                 : pendingVersion != null ? pendingLoader.title + " " + pendingVersion.id()
@@ -493,11 +485,9 @@ class LauncherScreen {
             if (accepted) {
                 try {
                     AccountStore.Account account = accounts().putOffline(value);
-                    accounts().selectDefault(account.id());
-                    selected = accountList().indexOf(account);
-                    setStatus("Playing offline as " + account.username() + ". Authenticated servers require your Microsoft account.", GOOD);
+                    setStatus("Offline profile created: " + account.username() + ".", GOOD);
                 } catch (IOException | IllegalArgumentException failure) {
-                    setStatus("Cannot add offline account: " + failure.getMessage(), ERROR);
+                    setStatus("Cannot create offline profile: " + failure.getMessage(), ERROR);
                 }
             }
         } else if (accepted) {
@@ -511,11 +501,7 @@ class LauncherScreen {
                     pendingVersion = null;
                     go(Page.INSTANCES, -1);
                     startInstanceOperation("Creating instance...", new InstanceStore.Operation(),
-                            op -> {
-                                installationRequest.set(InstallContinuation.Request.instance(value));
-                                try { return config.instances.create(value, profileFor(version, loader, op), op); }
-                                finally { installationRequest.remove(); }
-                            });
+                            op -> config.instances.create(value, profileFor(version, loader, op), op));
                 } else {
                     pendingCloneName = value;
                     cloneOptions = true;
@@ -633,7 +619,7 @@ class LauncherScreen {
     private boolean idle() {
         return !busy && !editor.active() && !systemKeyboardOpen && removePending == null && instanceRemovePending == null
                 && accountRemovePending == null && login == null && !cloneOptions && plan == null && pack == null
-                && galleryOpen < 0 && sharePreview == null;
+                && galleryOpen < 0;
     }
 
     /** An unexpected error in a frame: logged with its stack (launcher.log) and shown, not fatal. */
@@ -719,7 +705,7 @@ class LauncherScreen {
             case VERSIONS -> 1 + catalog.size();
             case SETTINGS -> SETTINGS_ROWS;
             case CREATE -> 2;
-            case ACCOUNTS -> accountList().size() + (offlineAvailable() ? 2 : 1);
+            case ACCOUNTS -> accountList().size() + 2;
             case MODS -> 1 + mods.size();
             case BROWSE -> browseRows();
             case PROJECT -> 1;
@@ -748,7 +734,7 @@ class LauncherScreen {
                 List<AccountStore.Account> list = accountList();
                 if (selected < list.size()) makeDefault(list.get(selected));
                 else if (selected == list.size()) startMicrosoftLogin();
-                else if (offlineAvailable()) beginEdit(Field.OFFLINE_NAME, source);
+                else beginEdit(Field.OFFLINE_NAME, source);
             }
             case SETTINGS -> {
                 switch (selected) {
@@ -843,7 +829,6 @@ class LauncherScreen {
                         if (config.instances.list().size() <= 1) setStatus("Keep at least one instance.", WARN);
                         else { instanceRemovePending = current.id(); removeConfirmed = false; }
                     }
-                    case 7 -> reviewLog();
                     default -> closeWindow();
                 }
             }
@@ -856,7 +841,7 @@ class LauncherScreen {
     private volatile double workFraction = -1;
 
     private static final List<String> HOME_ACTIONS = List.of("Play", "Mods", "Instance settings", "New instance",
-            "Clone", "Rename", "Remove", "Share crash log", "Quit");
+            "Clone", "Rename", "Remove", "Quit");
     /** Heap, GPU memory, JVM arguments, Minecraft arguments, debug log, Save, Back. */
     private static final int SETTINGS_ROWS = 7;
     private Page browseFrom = Page.MODS;
@@ -1047,13 +1032,10 @@ class LauncherScreen {
             if (dirty) config.save();
             // One account for every instance: the one selected on the Accounts page.
             AccountStore.Account account = accounts().resolveAccount("");
-            authClient().refresh(account.id());
+            if ("microsoft".equals(account.kind())) authClient().refresh(account.id());
             InstanceStore.Instance current = config.instances.get(instance.id());
             VersionStore.Installed version = config.installed(current);
-            if (version != null) {
-                if (ForgeInstaller.family(version.loader())) config.ensureLoaderRuntime(version.java(),(text,done) -> { workText=text; workFraction=done; });
-                else prepareRuntime(version.java());
-            }
+            if (version != null) prepareRuntime(version.java());
             return new LaunchPreparation(config).prepare(current, account.id());
         }, request -> {
             setStatus("Starting Minecraft...", GOOD);
@@ -1099,37 +1081,9 @@ class LauncherScreen {
 
     protected VersionStore.Installed installVersion(VersionStore.GameVersion version, VersionStore.Loader loader,
                                                     InstanceStore.Operation op) throws IOException {
-        return installVersion(version,loader,"",op);
-    }
-
-    protected VersionStore.Installed installVersion(VersionStore.GameVersion version, VersionStore.Loader loader,
-                                                    String build, InstanceStore.Operation op) throws IOException {
-        try {
-            VersionStore.Installed installed = config.versions.install(version, loader, build, op, true);
-            if (ForgeInstaller.family(loader)) config.ensureLoaderRuntime(installed.java(),op::progress);
-            else config.ensureRuntime(installed.java(),op::progress);
-            return installed;
-        } catch (ForgeInstaller.NeedsRuntime needed) {
-            config.ensureLoaderRuntime(needed.java,op::progress);
-            op.check();
-            String intent = InstallContinuation.prepare(config,version,loader,needed.build,LoaderLaunch.runtime(config.runtimes,needed.java),
-                    installationRequest.get()==null ? InstallContinuation.Request.version() : installationRequest.get());
-            results.add(() -> {
-                busy = false;
-                setStatus("Restarting to finish " + loader.title + " installation...",DIM);
-                presentNow();
-                if (op.cancelled()) {
-                    try { InstallContinuation.discard(config.home,config.runnerRoot); }
-                    catch (IOException failed) { setStatus("Cannot restore settings: " + failed.getMessage(),ERROR); return; }
-                    setStatus("Installation cancelled.",WARN); return;
-                }
-                int error = relaunch(intent);
-                try { InstallContinuation.discard(config.home,config.runnerRoot); }
-                catch (IOException recovery) { setStatus("Installation restart failed; cannot restore settings: " + recovery.getMessage(),ERROR); return; }
-                setStatus(String.format("Installation restart failed (0x%08x)",error),ERROR);
-            });
-            throw new InstallContinuation.RestartRequired();
-        }
+        VersionStore.Installed installed = config.versions.install(version, loader, op);
+        config.ensureRuntime(installed.java(), op::progress);
+        return installed;
     }
 
     /** Before a launch: the runtime the version needs, downloaded or updated, with progress in the status line. */
@@ -1183,23 +1137,15 @@ class LauncherScreen {
         return VersionStore::fetch;
     }
 
-    private boolean offlineAvailable() {
-        try { return accounts().hasOwnedMinecraft(); }
-        catch (IOException unavailable) { return false; }
-    }
-
-    private boolean isOfflineAccount(String id) {
-        return accountList().stream().anyMatch(a -> a.id().equals(id) && "offline".equals(a.kind()));
-    }
-
-    /** The selected Microsoft account's skin face, fetched in the background; 0 until available. */
+    /** The selected account's skin face, fetched in the background the first time; 0 until it is there. */
     private int faceTexture() {
         String uuid;
         try {
             String id = accounts().defaultAccountId();
-            uuid = accountList().stream().filter(a -> a.id().equals(id) && "microsoft".equals(a.kind())).map(AccountStore.Account::uuid).findFirst().orElse(null);
+            uuid = accountList().stream().filter(a -> a.id().equals(id)).map(AccountStore.Account::uuid).findFirst().orElse(null);
         } catch (IOException failure) { return 0; }
-        if (uuid == null) return 0;
+        if (uuid == null || accountList().stream().anyMatch(a -> a.uuid().equals(uuid) && "offline".equals(a.kind())))
+            return 0;
         Integer known = faces.get(uuid);
         if (known != null) return known;
         if (facesLoading.add(uuid)) {
@@ -1259,12 +1205,10 @@ class LauncherScreen {
                 accountRemovePending = null;
                 if (removeConfirmed) {
                     String name = accountName(id);
-                    boolean offline = isOfflineAccount(id);
                     try {
                         accounts().remove(id);
-                        setStatus(offline ? "Removed offline account " + name + "."
-                                : "Signed out " + name + "." + (offlineAvailable() ? "" : " Offline accounts are removed until you sign in again."), GOOD);
-                    } catch (IOException failure) { setStatus("Cannot remove account: " + failure.getMessage(), ERROR); }
+                        setStatus("Removed account " + name + ".", GOOD);
+                    } catch (IOException failure) { setStatus("Sign-out failed: " + failure.getMessage(), ERROR); }
                     selected = Math.min(selected, items() - 1);
                 }
                 input.releaseBarrier();
@@ -1724,7 +1668,7 @@ class LauncherScreen {
             ModrinthClient.VersionInfo v = version;
             if (v == null) {
                 List<ModrinthClient.VersionInfo> compatible = client.projectVersions(hit.projectId(), ModrinthClient.Type.MODPACK, true);
-                if (compatible.isEmpty()) throw new IOException("no compatible version of this pack runs on Minecraft 1.14 to "
+                if (compatible.isEmpty()) throw new IOException("no version of this pack runs Fabric or Quilt on Minecraft 1.14 to "
                         + VersionStore.newest());
                 v = compatible.get(0);
             }
@@ -1778,13 +1722,9 @@ class LauncherScreen {
         worker.execute(() -> {
             PackInstaller.Installed done = null;
             Exception error = null;
-            boolean restarting=false;
-            try {
-                installationRequest.set(InstallContinuation.Request.pack(chosenPack.name(),chosenPack.archive()));
-                done = packs.install(chosenPack, chosenPack.name(), operation);
-            } catch (InstallContinuation.RestartRequired needed) { restarting=true; error=needed; }
+            try { done = packs.install(chosenPack, chosenPack.name(), operation); }
             catch (Exception failure) { error = failure; }
-            finally { installationRequest.remove(); if (!restarting) deleteArchive(chosenPack); }
+            finally { deleteArchive(chosenPack); }
             // The pack's own icon becomes the instance's; without it the instance shows the block.
             if (done != null && packIcon != null && !packIcon.isEmpty()) {
                 try { config.instances.setIcon(done.instance().id(), modrinth.fetchPublic(packIcon)); }
@@ -1817,17 +1757,8 @@ class LauncherScreen {
         return VersionStore.fetch(url, max);
     }
 
-    protected byte[] fetchVerifiedPackFile(String url, String sha1, long size, long max) throws IOException {
-        return DownloadCache.bytes(config.home.resolve("cache/downloads"), url, "SHA-1", sha1, size, max);
-    }
-
     PackInstaller packInstaller() {
-        return new PackInstaller(new PackInstaller.Source() {
-            @Override public byte[] fetch(String url, long max) throws IOException { return fetchPackFile(url, max); }
-            @Override public byte[] verified(String url, String sha1, long size, long max) throws IOException {
-                return fetchVerifiedPackFile(url, sha1, size, max);
-            }
-        }, this::packProfile, config.instances);
+        return new PackInstaller(this::fetchPackFile, this::packProfile, config.instances);
     }
 
     /** An installed profile for the pack's Minecraft and loader, no older than its loader; else a fresh install. */
@@ -1839,14 +1770,12 @@ class LauncherScreen {
             return config.metadata;
         for (VersionStore.Installed installed : config.versions.list())
             if (installed.minecraft().equals(minecraft) && installed.loader() == loader
-                    && (ForgeInstaller.family(loader) ? installed.loaderVersion().equals(loaderVersion)
-                        : VersionStore.compare(VersionStore.parts(installed.loaderVersion()), wanted) >= 0))
+                    && VersionStore.compare(VersionStore.parts(installed.loaderVersion()), wanted) >= 0)
                 return installed.gameProfile();
         op.progress("Finding Minecraft " + minecraft + "...");
         for (VersionStore.GameVersion version : fetchCatalog(loader))
             if (version.id().equals(minecraft)) {
-                VersionStore.Installed fresh = ForgeInstaller.family(loader) ? installVersion(version,loader,loaderVersion,op)
-                        : installVersion(version, loader, op);
+                VersionStore.Installed fresh = installVersion(version, loader, op);
                 if (VersionStore.compare(VersionStore.parts(fresh.loaderVersion()), wanted) < 0)
                     throw new IOException("the pack needs " + loader.title + " loader " + loaderVersion + "; the newest is "
                             + fresh.loaderVersion());
@@ -1881,7 +1810,6 @@ class LauncherScreen {
         if (instanceRemovePending != null) drawInstanceRemoveDialog(s);
         if (accountRemovePending != null) drawAccountRemoveDialog(s);
         if (login != null) drawLoginDialog(s);
-        if (sharePreview != null) drawShareLog(s);
         if (cloneOptions) drawCloneOptions(s);
         if (plan != null) drawPlanDialog(s);
         if (pack != null) drawPackDialog(s);
@@ -2070,7 +1998,7 @@ class LauncherScreen {
             case CREATE -> "Left/Right: choose   Cross/Enter: open   Circle/Escape: back";
             case SETTINGS -> "Left/Right: change   Cross/Enter: edit or select   Circle/Escape: back";
             case INSTANCES -> "Cross/Enter: select   Left/Right or Tab: focus   L1/R1: section";
-            case ACCOUNTS -> "Cross: use this account   Triangle: remove account   Circle: back   L1/R1: section";
+            case ACCOUNTS -> "Cross: use/add account   Triangle: remove   Circle: back   L1/R1: section";
             default -> "Cross/Enter: select   Circle/Escape: back   L1/R1: section";
         };
     }
@@ -2303,7 +2231,6 @@ class LauncherScreen {
         float x = 350 * s, w = 1220 * s, fieldH = args ? 260 * s : 60 * s, h = 260 * s + fieldH, y = (r.height - h) / 2;
         dialog(x, y, w, h);
         r.text(editingField == Field.JVM_ARGS ? "JVM ARGUMENTS" : editingField == Field.GAME_ARGS ? "MINECRAFT ARGUMENTS"
-                : editingField == Field.OFFLINE_NAME ? "ADD OFFLINE ACCOUNT"
                 : nameMode == NameMode.CREATE ? "CREATE INSTANCE" : nameMode == NameMode.CLONE
                 ? "CLONE INSTANCE" : "RENAME INSTANCE", x + 40 * s, y + 35 * s, 3.5f * s, TEXT);
         String value = editor.value();
@@ -2384,88 +2311,15 @@ class LauncherScreen {
         List<Integer> colors = new ArrayList<>();
         for (AccountStore.Account account : accountList()) {
             boolean isDefault = account.id().equals(defaultId);
-            rows.add(account.username() + ("offline".equals(account.kind()) ? "   Offline account" : "   Microsoft account") + (isDefault ? "   (in use)" : ""));
+            rows.add(account.username() + "   " + ("offline".equals(account.kind())
+                    ? "Offline profile" : "Microsoft account") + (isDefault ? "   (in use)" : ""));
             colors.add(TEXT);
         }
         rows.add("Add Microsoft account");
         colors.add(ACCENT_HI);
-        if (offlineAvailable()) {
-            rows.add("Add offline account");
-            colors.add(ACCENT_HI);
-        }
+        rows.add("Add offline account");
+        colors.add(ACCENT_HI);
         list(rows, colors, 120 * s, 280 * s, 1680 * s, 12);
-    }
-
-    private void reviewLog() {
-        InstanceStore.Instance instance = config.selectedInstance();
-        background("Preparing a log for review...", true, () -> {
-            Path source = crash != null && crash.source() != null ? crash.source() : instance.gameDir().resolve("logs/latest.log");
-            if (!Files.isRegularFile(source)) source = config.home.resolve("launcher.log");
-            String snapshot = LogSharing.prepare(source);
-            LauncherFiles.write(config.home.resolve("shared-report.txt"), snapshot.getBytes(StandardCharsets.UTF_8), true);
-            return snapshot;
-        }, snapshot -> {
-            sharePreview = snapshot; shareUrl = null; shareQr = null; shareScroll = 0;
-            shareLines = LogSharing.preview(snapshot, 1320, character -> r.width(String.valueOf(character), 2));
-            setStatus("Review the report. Cross uploads it to mclo.gs; Circle cancels.", WARN);
-        });
-    }
-
-    protected String uploadSharedLog(String content) throws IOException { return LogSharing.upload(content); }
-
-    private void shareLogAction(Input.Action action) {
-        if (busy) return;
-        switch (action) {
-            case BACK -> { sharePreview = null; shareUrl = null; shareQr = null; input.releaseBarrier(); }
-            case HOME -> shareScroll = 0;
-            case END -> shareScroll = Math.max(0, shareLines.size() - 12);
-            case LEFT -> shareScroll = Math.max(0, shareScroll - 12);
-            case RIGHT -> shareScroll = Math.min(Math.max(0, shareLines.size() - 12), shareScroll + 12);
-            case UP -> shareScroll = Math.max(0, shareScroll - 1);
-            case DOWN -> shareScroll = Math.min(Math.max(0, shareLines.size() - 12), shareScroll + 1);
-            case CONFIRM -> {
-                if (shareUrl != null) { sharePreview = null; shareUrl = null; shareQr = null; }
-                else {
-                    String snapshot = sharePreview;
-                    background("Uploading reviewed report to mclo.gs...", () -> uploadSharedLog(snapshot), url -> {
-                        shareUrl = url; shareQr = LoginQr.encode(url);
-                        setStatus("Log shared: " + url, GOOD);
-                        try { LauncherFiles.write(config.home.resolve("shared-log-url.txt"), (url + "\n").getBytes(StandardCharsets.UTF_8), false); }
-                        catch (IOException unavailable) { setStatus("Log shared: " + url + " (could not save link locally)", WARN); }
-                    });
-                }
-            }
-            default -> { }
-        }
-    }
-
-    private void drawShareLog(float s) {
-        float x = 260 * s, y = 130 * s, w = 1400 * s, h = 820 * s;
-        dialog(x, y, w, h);
-        r.text(shareUrl == null ? "REVIEW LOG BEFORE SHARING" : "LOG SHARED", x + 40 * s, y + 35 * s, 3.5f * s, TEXT);
-        if (shareUrl == null) {
-            r.text("Upload to mclo.gs creates a shareable page. Review for personal information.", x + 40 * s, y + 105 * s, 2.4f * s, WARN);
-            r.text("Known credentials, chat entries, email and IP addresses have been removed.", x + 40 * s, y + 145 * s, 2.4f * s, DIM);
-            for (int i = 0; i < 12 && shareScroll + i < shareLines.size(); i++)
-                r.text(shareLines.get(shareScroll + i), x + 40 * s, y + (215 + i * 34) * s, 2f * s, TEXT);
-            r.text("Up/Down: review   Left/Right: page   Row " + (shareScroll + 1) + " of " + shareLines.size(), x + 40 * s, y + 660 * s, 2.4f * s, DIM);
-            clicks.wheel(x + 30 * s, y + 200 * s, w - 60 * s, 430 * s,
-                    amount -> shareScroll = Math.max(0, Math.min(Math.max(0, shareLines.size() - 12), shareScroll - (int) amount * 3)));
-        } else {
-            LoginQr.draw(r, shareQr, x + 40 * s, y + 150 * s, 450 * s);
-            r.text("Scan this QR code to open your report.", x + 550 * s, y + 190 * s, 2.8f * s, TEXT);
-            r.text(shareUrl, x + 550 * s, y + 255 * s, 3.2f * s, ACCENT_HI);
-            r.text("Send this link with your bug report.", x + 550 * s, y + 330 * s, 2.8f * s, DIM);
-        }
-        float by = y + 730 * s;
-        r.roundRect(x + 40 * s, by, 300 * s, 60 * s, 12 * s, ACCENT);
-        r.textCentered(busy ? "Uploading..." : shareUrl == null ? "Upload to mclo.gs" : "Done", x + 40 * s, by, 300 * s, 60 * s, 2.5f * s, TEXT);
-        hit(x + 40 * s, by, 300 * s, 60 * s, null, Input.Action.CONFIRM);
-        if (shareUrl == null) {
-            r.roundRect(x + 370 * s, by, 260 * s, 60 * s, 12 * s, PANEL);
-            r.textCentered("Cancel", x + 370 * s, by, 260 * s, 60 * s, 2.5f * s, TEXT);
-            hit(x + 370 * s, by, 260 * s, 60 * s, null, Input.Action.BACK);
-        }
     }
 
     private void drawLoginDialog(float s) {
@@ -2491,13 +2345,11 @@ class LauncherScreen {
     private void drawAccountRemoveDialog(float s) {
         float x = 380 * s, y = 340 * s;
         dialog(x, y, 1160 * s, 350 * s);
-        boolean offline = isOfflineAccount(accountRemovePending);
-        r.text(r.fit((offline ? "Remove " : "Sign out ") + accountName(accountRemovePending) + "?", 1080 * s, 3.5f * s),
+        r.text(r.fit("Sign out " + accountName(accountRemovePending) + "?", 1080 * s, 3.5f * s),
                 x + 35 * s, y + 35 * s, 3.5f * s, TEXT);
-        r.text(offline ? "This offline profile is removed. Your worlds and instances are kept."
-                : "Signing out your last premium account also removes offline accounts.", x + 35 * s, y + 115 * s,
+        r.text("The saved sign-in is deleted. Instances set to it will ask for another.", x + 35 * s, y + 115 * s,
                 2.5f * s, WARN);
-        choice(x + 35 * s, y + 235 * s, "Cancel", offline ? "Remove" : "Sign out", removeConfirmed, ERROR,
+        choice(x + 35 * s, y + 235 * s, "Cancel", "Sign out", removeConfirmed, ERROR,
                 () -> removeConfirmed = false, () -> removeConfirmed = true);
     }
 
